@@ -93,6 +93,9 @@
 - `POST /api/release`：请求体
   `{requestId, dataset, dimensions{}, metric, aggregation(COUNT|SUM|AVG),
   role, policyVersion}`；成功 200（`ALLOWED/DEGRADED`），拒绝 422（`REJECTED`）。
+- `POST /api/release/batch`：批量发布，请求体
+  `{requestId, dataset, groups[dimensions{}, ...], metric, aggregation, role, policyVersion}`；
+  逐组处理恒为 200，逐组结论在 `results` 中；仅信封缺 `requestId`/`groups` 时 400。
 - `GET /api/budgets?dataset=sales&region=us`：账户总额 / 余额 / 已耗。
 - `GET /api/policies`、`GET /api/policies/{version}`：已注册版本与参数。
 
@@ -102,12 +105,56 @@
 curl -s -XPOST localhost:8080/api/release -H 'Content-Type: application/json' -d '{
   "requestId":"demo-1","dataset":"sales","dimensions":{"region":"us"},
   "metric":"amount","aggregation":"SUM","role":"analyst","policyVersion":"policy-sales-v1"}'
+
+curl -s -XPOST localhost:8080/api/release/batch -H 'Content-Type: application/json' -d '{
+  "requestId":"demo-b1","dataset":"sales",
+  "groups":[{"region":"us"},{"region":"eu"}],
+  "metric":"amount","aggregation":"SUM","role":"analyst","policyVersion":"policy-sales-v1"}'
 ```
 
-## 6. 验证方法
+## 6. 批量发布语义
+
+### 6.1 逐组独立判定与部分成功
+
+- 一次批量请求携带多个分组条件（`groups`），共享 dataset / metric / aggregation /
+  role / policyVersion；每个分组走与单请求完全相同的判定路径，单独给出结论：
+  加噪后的值、分组规模、本次预算扣减、判定依据，状态为
+  `ALLOWED`（正常）/ `DEGRADED`（带降级说明）/ `REJECTED`（被拒绝或失败）。
+- `results` 顺序与请求 `groups` 一一对应；任一分组被拒绝或算不出来都**不影响**
+  其它分组，能出的结论照常出。
+- 批量整体状态仅为汇总：`ALL_SUCCEEDED` / `PARTIAL_SUCCESS` / `ALL_FAILED`。
+- 只有信封级问题（缺 `requestId`、`groups` 为空）才整体拒绝（HTTP 400），
+  此时不消耗任何预算；字段级问题（如 dataset 不存在）体现为逐组拒绝。
+
+### 6.2 预算对账
+
+- 只有真正出结果的分组（`ALLOWED` / `DEGRADED`）才按策略 epsilon 扣减；
+  被拒绝或失败的分组 `budgetDelta` 恒为 0，一分预算都不占。
+- 响应中的 `totalBudgetDelta` 恒等于各出结果分组 `budgetDelta` 之和，
+  也恒等于本批对账本（`GET /api/budgets`）造成的实际变化，可直接对账。
+- 一批中多个分组命中同一预算键（维度组合相同）时，在同一账户上顺序扣减，
+  后一个分组的 `budgetBefore` 接上前一个的 `budgetRemaining`；
+  并发下同一账户的“检查 + 扣减”原子完成，绝不超扣。
+
+### 6.3 失败与重试语义
+
+- **确定性业务拒绝**（无权限、分组过小、预算不足、策略冲突等）：幂等可复现。
+  同一 `requestId` 重发命中缓存，结论逐位一致，绝不重复扣预算。
+- **内部处理失败**（底层数据或内部处理异常）：对外归一化为稳定的
+  `internal_processing_error`，不夹带异常类名、堆栈等内部细节；该分组净扣减为零，
+  且**不进入幂等缓存**——底层恢复后，同一 `requestId` 原样重发会重新计算并拿到新结论
+  （批量重发时只重算曾失败的分组，已出结果的分组命中缓存不重复扣）。
+
+### 6.4 与旧用法的兼容范围
+
+- `POST /api/release` 单分组请求的报文、状态码、结论字段与幂等行为完全不变；
+  唯一的行为修正：原先内部失败结论会被缓存导致只能换 requestId 重试，
+  现在内部失败不再缓存，恢复后同标识重发即可拿到新结论（确定性拒绝的幂等性不变）。
+
+## 7. 验证方法
 
 ```bash
-mvn test                       # 全部 18 个用例
+mvn test                       # 全部 28 个用例
 mvn test -Dtest=BudgetConcurrencyTest
 ```
 
@@ -120,6 +167,10 @@ mvn test -Dtest=BudgetConcurrencyTest
 | `RejectionClassificationTest` | 7 种拒绝原因可区分；越权(40)+冲突(50) 并存时确定性归为越权；缺失字段降级带 notice |
 | `DeterministicNoiseTest` | 噪声纯函数复现、版本/维度敏感性、scale=1/epsilon |
 | `ApiIntegrationTest` | HTTP 成功路径、坏 JSON 归一化、越权区分、预算端点 |
+| `BatchReleaseTest` | 批量部分成功不连累其它分组；响应合计与账本严格对账；批内同键顺序扣减；确定性拒绝重发幂等不重复扣 |
+| `BatchBudgetConcurrencyTest` | 12 个并发批量抢同一预算键：恰好 3 组成功，响应扣减合计 = 账本已扣 = 总额，不超扣 |
+| `TransientFailureRetryTest` | 内部失败零扣减、不缓存、对外无内部细节；恢复后同一 requestId 重发拿到新结论且只扣一次；批量重发只重算失败分组 |
+| `BatchApiIntegrationTest` | 批量 HTTP 入口逐组结论、信封 400、重发命中缓存、预算端点可对账；单请求端点行为不变 |
 
 测试与运行日志对每次判定打印 **请求标识、预算变化（before→remaining(-delta)）与
 判定依据**，例如：
@@ -128,4 +179,7 @@ mvn test -Dtest=BudgetConcurrencyTest
 requestId=exh-seq-2 判定=ALLOWED 预算变化 key=exh-…#region=us 2.0000->1.0000(-1.0000)
   依据=policyVersion=… | groupSize=3>=3 | epsilon=1.0 | budget 2.0000-1.0000=1.0000 | noiseScale=1.0000
 requestId=r-prio 判定=REJECTED 预算变化=0 依据=access_denied detail=角色无权访问字段: region
+requestId=demo-b1 判定=ALLOWED 预算变化 key=sales#region=us 3.0000->2.0000(-1.0000) 依据=…
+requestId=demo-b1 判定=REJECTED 预算变化=0 依据=group_too_small detail=分组规模 2 小于最小阈值 3
+requestId=demo-b1 批量汇总 判定=PARTIAL_SUCCESS 分组数=2 成功=1 失败=1 整批预算净变化=-1.0000
 ```

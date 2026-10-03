@@ -6,6 +6,9 @@ import com.github.h3yow.privacyreleasegatewayjava.budget.BudgetKey;
 import com.github.h3yow.privacyreleasegatewayjava.budget.BudgetLedger;
 import com.github.h3yow.privacyreleasegatewayjava.data.DataRow;
 import com.github.h3yow.privacyreleasegatewayjava.data.DatasetRepository;
+import com.github.h3yow.privacyreleasegatewayjava.model.BatchGatewayResponse;
+import com.github.h3yow.privacyreleasegatewayjava.model.BatchQueryRequest;
+import com.github.h3yow.privacyreleasegatewayjava.model.BatchStatus;
 import com.github.h3yow.privacyreleasegatewayjava.model.ErrorCode;
 import com.github.h3yow.privacyreleasegatewayjava.model.GatewayResponse;
 import com.github.h3yow.privacyreleasegatewayjava.model.QueryRequest;
@@ -20,6 +23,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -29,10 +33,16 @@ import java.util.concurrent.ConcurrentMap;
  * <p>
  * 关键不变量：
  * <ol>
- *   <li>同一 requestId 的结论只计算一次并快照缓存：重复请求不重复扣预算。</li>
+ *   <li>同一 requestId 的确定性结论只计算一次并快照缓存：重复请求不重复扣预算。</li>
  *   <li>任何拒绝（解析 / 越权 / 冲突 / 缺失 / 分组过小 / 预算不足 / 内部错误）都发生在预算扣减之前，
  *       被拒绝的请求绝不消耗预算。</li>
- *   <li>预算“余额检查 + 扣减”在账本账户内原子完成；聚合与噪声在同一扣减视图下生成，结论可解释。</li>
+ *   <li>预算“余额检查 + 扣减”在账本账户内原子完成，且是整个判定链路中唯一的副作用点
+ *       （聚合与噪声均为纯计算，先于扣减完成），因此内部处理失败的净扣减恒为零。</li>
+ *   <li>内部处理失败（{@link ErrorCode#INTERNAL_PROCESSING_ERROR}）不进入幂等缓存：
+ *       底层恢复后，同一 requestId 原样重发可得到新的结论；
+ *       确定性业务拒绝（越权 / 分组过小 / 预算不足等）仍然幂等可复现。</li>
+ *   <li>批量请求逐组独立判定：单组被拒绝或失败不影响其它分组；
+ *       整批预算净变化恒等于各出结果分组 budgetDelta 之和。</li>
  *   <li>多问题命中时取 {@link ErrorCode#priority()} 最小者，归类完全确定且可复现。</li>
  * </ol>
  */
@@ -41,6 +51,8 @@ public class PrivacyGateway {
 
     private static final Logger log = LoggerFactory.getLogger(PrivacyGateway.class);
     private static final double DEFAULT_BUDGET_TOTAL = 3.0d;
+    /** 批量分组的幂等缓存键前缀，与单请求 requestId 命名空间隔离。 */
+    private static final String BATCH_CACHE_KEY_PREFIX = "batch:";
 
     private final DatasetRepository datasetRepository;
     private final PolicyRegistry policyRegistry;
@@ -62,44 +74,120 @@ public class PrivacyGateway {
         this.budgetLedger = budgetLedger;
     }
 
+    /**
+     * 单分组发布（原始用法，行为不变）。
+     */
     public GatewayResponse submit(QueryRequest request) {
         if (request == null) {
             return reject(null, null, null, ErrorCode.MALFORMED_REQUEST, "请求体为空", null);
         }
+        return processOnce(request.requestId(), request);
+    }
+
+    /**
+     * 批量发布：一次请求携带多个分组条件，逐组独立判定。
+     * 单组被拒绝 / 失败不影响其它分组；出结果的分组才扣预算，失败分组净扣减为零。
+     * 同一批量 requestId 重发时：确定性结论（含成功与业务拒绝）命中缓存不重复扣预算；
+     * 曾因内部错误失败的分组会重新计算，底层恢复后即可拿到新结论。
+     */
+    public BatchGatewayResponse submitBatch(BatchQueryRequest request) {
+        if (request == null || isBlank(request.requestId())
+                || request.groups() == null || request.groups().isEmpty()) {
+            return rejectBatch(request == null ? null : request.requestId(),
+                    "批量请求必填 requestId 与至少一个分组条件");
+        }
         String requestId = request.requestId();
-        // 同一 requestId 串行化，避免并发重复请求在缓存写入前同时进入扣减。
-        Object lock = idempotencyLocks.computeIfAbsent(requestId, k -> new Object());
+        List<Map<String, String>> groups = request.groups();
+        List<GatewayResponse> results = new ArrayList<>(groups.size());
+
+        for (int i = 0; i < groups.size(); i++) {
+            QueryRequest groupRequest = new QueryRequest(
+                    requestId, request.dataset(), groups.get(i),
+                    request.metric(), request.aggregation(),
+                    request.role(), request.policyVersion());
+            // 逐组幂等键：批量内第 i 个分组的确定性结论只计算一次。
+            String cacheKey = BATCH_CACHE_KEY_PREFIX + requestId + "#" + i;
+            results.add(processOnce(cacheKey, groupRequest));
+        }
+
+        int succeeded = 0;
+        double totalDelta = 0d;
+        for (GatewayResponse r : results) {
+            if (r.getStatus() == ReleaseStatus.ALLOWED || r.getStatus() == ReleaseStatus.DEGRADED) {
+                succeeded++;
+                totalDelta += r.getBudgetDelta() == null ? 0d : r.getBudgetDelta();
+            }
+        }
+        int failed = results.size() - succeeded;
+        BatchStatus batchStatus = failed == 0 ? BatchStatus.ALL_SUCCEEDED
+                : succeeded == 0 ? BatchStatus.ALL_FAILED
+                : BatchStatus.PARTIAL_SUCCESS;
+
+        BatchGatewayResponse batch = new BatchGatewayResponse();
+        batch.setRequestId(requestId);
+        batch.setBatchStatus(batchStatus);
+        batch.setTotalGroups(results.size());
+        batch.setSucceeded(succeeded);
+        batch.setFailed(failed);
+        batch.setTotalBudgetDelta(roundTo(totalDelta, 6));
+        batch.setResults(results);
+
+        log.info("requestId={} 批量汇总 判定={} 分组数={} 成功={} 失败={} 整批预算净变化=-{}",
+                requestId, batchStatus, results.size(), succeeded, failed, format(totalDelta));
+        return batch;
+    }
+
+    /**
+     * 幂等处理骨架：同一缓存键串行化；命中缓存直接返回副本；
+     * 只有确定性结论才写入缓存（内部处理失败不缓存，允许底层恢复后重试）。
+     */
+    private GatewayResponse processOnce(String cacheKey, QueryRequest request) {
+        Object lock = idempotencyLocks.computeIfAbsent(cacheKey, k -> new Object());
         try {
             synchronized (lock) {
-                GatewayResponse cached = idempotencyCache.get(requestId);
+                GatewayResponse cached = idempotencyCache.get(cacheKey);
                 if (cached != null) {
-                    log.info("requestId={} 判定=命中幂等缓存 预算变化=0 依据=requestId 已有结论 status={} errorCode={}",
-                            requestId, cached.getStatus(), cached.getErrorCode());
+                    log.info("requestId={} 判定=命中幂等缓存 预算变化=0 依据=缓存键 {} 已有结论 status={} errorCode={}",
+                            request.requestId(), cacheKey, cached.getStatus(), cached.getErrorCode());
                     // 返回副本并标注命中，缓存内的原始快照保持不可变。
                     GatewayResponse copy = copyOf(cached);
                     copy.setDeduplicated(true);
                     return copy;
                 }
-                try {
-                    GatewayResponse response = doSubmit(request);
-                    idempotencyCache.put(requestId, response);
-                    return response;
-                } catch (GatewayException e) {
-                    GatewayResponse response = reject(request, null, null, e.errorCode(), e.getMessage(), null);
-                    idempotencyCache.put(requestId, response);
-                    return response;
-                } catch (RuntimeException e) {
-                    // 任何未被分层捕获的底层失败，统一归一化，绝不透出原始异常信息。
-                    log.warn("requestId={} 归一化未知内部失败: {}", requestId, e.getClass().getSimpleName());
-                    GatewayResponse response = reject(request, null, null,
-                            ErrorCode.INTERNAL_PROCESSING_ERROR,
-                            ErrorCode.INTERNAL_PROCESSING_ERROR.safeMessage(), null);
-                    idempotencyCache.put(requestId, response);
-                    return response;
+                GatewayResponse response = processSafely(request);
+                if (isCacheable(response)) {
+                    idempotencyCache.put(cacheKey, response);
+                } else {
+                    log.info("requestId={} 判定=内部处理失败 不写入幂等缓存，同一请求标识可在恢复后重试",
+                            request.requestId());
                 }
+                return response;
             }
         } finally {
-            idempotencyLocks.remove(requestId, lock);
+            idempotencyLocks.remove(cacheKey, lock);
+        }
+    }
+
+    /** 内部处理失败属于非确定性结论，不得缓存；其余结论（成功 / 确定性拒绝）均可缓存。 */
+    private static boolean isCacheable(GatewayResponse response) {
+        return !(response.getStatus() == ReleaseStatus.REJECTED
+                && ErrorCode.INTERNAL_PROCESSING_ERROR.code().equals(response.getErrorCode()));
+    }
+
+    /**
+     * 把任何逃出分层捕获的异常归一化为稳定错误类型，绝不透出内部细节；
+     * 归一化发生在预算扣减之前（扣减是 doSubmit 中最后的副作用），失败净扣减为零。
+     */
+    private GatewayResponse processSafely(QueryRequest request) {
+        try {
+            return doSubmit(request);
+        } catch (GatewayException e) {
+            return reject(request, null, null, e.errorCode(), e.getMessage(), null);
+        } catch (RuntimeException e) {
+            log.warn("requestId={} 归一化未知内部失败: {}", request.requestId(), e.getClass().getSimpleName());
+            return reject(request, null, null,
+                    ErrorCode.INTERNAL_PROCESSING_ERROR,
+                    ErrorCode.INTERNAL_PROCESSING_ERROR.safeMessage(), null);
         }
     }
 
@@ -162,22 +250,23 @@ public class PrivacyGateway {
                     "分组规模 " + groupSize + " 小于最小阈值 " + policy.minGroupSize());
         }
 
-        // 噪声纯函数确定、无副作用；即便随后预算拒绝也不会产生任何影响。
+        // 噪声与聚合均为纯函数、无副作用，先于扣减完成：
+        // 这些步骤若因底层问题失败，预算尚未变动，净扣减恒为零。
         DeterministicNoise.NoiseResult noise = DeterministicNoise.generate(
                 policy.version(), request.dataset(), budgetKey.dimensionKey(),
                 request.metric(), request.aggregation().name(), policy.epsilon());
 
-        // 唯一的副作用点：原子“检查 + 扣减”。此后的步骤均为纯计算，
-        // 保证扣减与结果生成处于同一状态视图。
+        double trueValue = aggregationEngine.aggregate(
+                evaluation.usableRows(), request.metric(), request.aggregation());
+        double released = roundTo(trueValue + noise.noise(), 6);
+
+        // 唯一的副作用点：原子“检查 + 扣减”。此后再无任何可能失败的步骤，
+        // 保证扣减与结果生成处于同一状态视图，且失败请求绝不消耗预算。
         BudgetAccount.ConsumeResult consumed =
                 budgetLedger.consume(budgetKey, policy.epsilon(), DEFAULT_BUDGET_TOTAL);
         if (consumed == null) {
             throw new GatewayException(ErrorCode.BUDGET_EXHAUSTED, "隐私预算余额不足");
         }
-
-        double trueValue = aggregationEngine.aggregate(
-                evaluation.usableRows(), request.metric(), request.aggregation());
-        double released = roundTo(trueValue + noise.noise(), 6);
 
         ReleaseStatus status = evaluation.notices().isEmpty()
                 ? ReleaseStatus.ALLOWED : ReleaseStatus.DEGRADED;
@@ -265,6 +354,23 @@ public class PrivacyGateway {
         response.setDecisionBasis("拒绝类型=" + errorCode.code()
                 + "(优先级=" + errorCode.priority() + "): " + detail);
         return response;
+    }
+
+    /** 批量信封级拒绝：无法逐组处理时整体返回，不消耗任何预算。 */
+    private BatchGatewayResponse rejectBatch(String requestId, String detail) {
+        log.info("requestId={} 判定=BATCH_REJECTED 预算变化=0 依据={} detail={}",
+                requestId, ErrorCode.MALFORMED_REQUEST.code(), detail);
+        BatchGatewayResponse batch = new BatchGatewayResponse();
+        batch.setRequestId(requestId);
+        batch.setBatchStatus(BatchStatus.ALL_FAILED);
+        batch.setTotalGroups(0);
+        batch.setSucceeded(0);
+        batch.setFailed(0);
+        batch.setTotalBudgetDelta(0d);
+        batch.setResults(List.of());
+        batch.setErrorCode(ErrorCode.MALFORMED_REQUEST.code());
+        batch.setErrorMessage(ErrorCode.MALFORMED_REQUEST.safeMessage() + ": " + detail);
+        return batch;
     }
 
     private static boolean isBlank(String s) {
