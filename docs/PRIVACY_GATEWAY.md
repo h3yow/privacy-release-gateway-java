@@ -12,19 +12,24 @@
 - 结论按 `requestId` 幂等快照缓存：重复请求直接返回缓存副本（`deduplicated=true`），
   **不重复计算、不重复扣预算**；同一 `requestId` 在并发下按键串行化，
   双重检查缓存后才进入扣减。
+- **只有确定性结论入缓存**：成功（`ALLOWED/DEGRADED`）与确定性业务拒绝
+  （越权、分组过小、预算不足等）可复现，重发命中缓存；`internal_processing_error`
+  视为瞬时故障**不入缓存**——底层恢复后同一 `requestId` 原样重发即可拿到新结论，
+  不必换标识（见 §5.3）。
 
 请求处理流水线（所有拒绝点都位于预算扣减之前）：
 
 ```
 报文校验 → 数据集存在性 → 策略版本解析 → 维度过滤
         → 策略求值（越权 / 冲突 / 字段缺失降级）→ 分组阈值
-        → 确定性噪声（纯函数，无副作用）
-        → 预算原子扣减（唯一副作用点）→ 聚合 → 加噪结果
+        → 确定性噪声（纯函数，无副作用）→ 聚合（纯计算）
+        → 预算原子扣减（唯一副作用点）→ 加噪结果
 ```
 
-噪声在扣减前生成是刻意为之：它是无副作用纯函数；唯一可能失败的聚合在扣减**之后**
-执行，而聚合只读取求值阶段已确认存在且可解析的字段。这样
-「扣减与结果生成处于同一可解释状态视图」，且任何拒绝都不消耗预算。
+噪声与聚合都在扣减**之前**完成是刻意为之：两者都是无副作用的纯计算，
+底层数据问题（如指标值无法解析）会在扣减前暴露，因此**任何失败 / 拒绝的净扣减
+严格为零**；扣减之后只剩加噪与舍入，不可能再失败，
+「扣减与结果生成处于同一可解释状态视图」。
 
 ## 2. 隐私预算模型
 
@@ -86,13 +91,73 @@
   逃出控制器的异常由 `GlobalExceptionHandler` 兜底。
 - 响应只含 `code + 安全文案`，**不包含堆栈、异常类名或原始 message**
   （内部细节仅以 WARN 日志记录异常类型）。
-- 被拒绝的请求不进入扣减，幂等缓存同样缓存拒绝快照。
+- 被拒绝的请求不进入扣减；确定性业务拒绝（优先级 10–80）的快照入幂等缓存，
+  `internal_processing_error`（90）不入缓存，可随底层恢复重试出新结论。
 
-## 5. 接口
+## 5. 批量发布（一次请求多个分组）
+
+`POST /api/release/batch` 接受 `{requestId, dataset, groups:[{groupId, dimensions}],
+metric, aggregation, role, policyVersion}`：数据集 / 指标 / 聚合 / 角色 / 策略版本
+在批内共享，`groups` 携带多个分组条件。每个分组走与单发**完全相同**的判定路径，
+结论互不依赖。
+
+### 5.1 部分成功语义
+
+- 只要批量级字段合法，响应恒为 HTTP 200，逐分组结论在 `results` 中
+  （顺序与请求一致）；`batchError` 仅当整批报文不合法（如缺 `requestId`、
+  `groups` 为空）时出现，此时 HTTP 400 且不处理任何分组。
+- 每个分组结论（`GroupOutcome`）与单发响应字段一一对应：
+  `status(ALLOWED/DEGRADED/REJECTED)`、加噪值 `value`、`groupSize`、
+  `budgetBefore/Delta/Remaining`、`notices`（降级说明）、`errorCode/errorMessage`、
+  `decisionBasis`。
+- 某个分组被拒绝或内部失败**不影响其它分组**：能出结论的分组照常出结论，
+  响应头部的 `allowedGroups / degradedGroups / rejectedGroups` 给出计数。
+
+### 5.2 预算对账
+
+- 只有真正出了结果的分组（`ALLOWED/DEGRADED`）才按规则扣减；
+  被拒绝 / 失败的分组 `budgetDelta` 恒为 0，一分预算都不占。
+- 批内多个分组维度相同则**共用同一预算键**，扣减在同一账户锁上串行发生，
+  响应中可见链式衔接（后一分组的 `budgetBefore` == 前一分组的 `budgetRemaining`）；
+  维度不同则各用各的账户。并发下同一预算键不会被扣超（账户内置锁保证）。
+- 响应的 `budgetUsage` 按预算键汇总本批净扣减：`totalDelta` 等于该键下本次调用
+  真正扣减之和，`remaining` 为本批处理后的余额。对账不变量：
+  **Σ(各组 budgetDelta) == Σ(budgetUsage.totalDelta) == 本次调用对账本的实际影响**，
+  且与事后 `GET /api/budgets?dataset=…&k=v` 查到的账户状态一致。
+- 命中幂等缓存的重放分组（`deduplicated=true`）本次没有产生新扣减，
+  不计入 `budgetUsage`，保证上述等式对每一次调用都严格成立。
+
+### 5.3 失败与重试语义
+
+- 分组因底层数据 / 内部处理失败时，对外只有稳定类型 `internal_processing_error`
+  与安全文案，不夹带堆栈、类名等内部细节；该分组净扣减严格为零
+  （聚合等纯计算已移到扣减之前，见 §1 流水线）。
+- **瞬时失败不入幂等缓存**：底层恢复后，同一 `requestId` 原样重发，
+  失败分组会重新判定并给出新结论；同批已成功 / 已确定拒绝的分组命中各自缓存，
+  不会重复扣预算。幂等粒度 = `requestId + 分组标识`
+  （`groupId`，缺省时为组内下标），因此重试时请求体应保持原样。
+- 确定性业务拒绝（没权限、分组太小、预算不够等）保持幂等可复现：
+  同一 `requestId` 重发返回缓存的同一拒绝结论，不会再次扣预算。
+- 以上语义对单发路径同样生效：`internal_processing_error` 不再被缓存，
+  单发请求在底层恢复后用同一 `requestId` 重发同样能拿到新结论。
+
+### 5.4 与旧用法的兼容范围
+
+- `POST /api/release` 单发请求的报文、响应字段、状态码与判定行为完全不变；
+  唯一的行为修正是 `internal_processing_error` 不再被幂等缓存固化
+  （旧行为下同一 `requestId` 会永远返回失败，这正是本次要修掉的问题）。
+- 批量端点是新增能力，不改变单发路径；批量中每个分组的判定规则、
+  错误分类、预算单价与单发完全一致。
+
+## 6. 接口
 
 - `POST /api/release`：请求体
   `{requestId, dataset, dimensions{}, metric, aggregation(COUNT|SUM|AVG),
   role, policyVersion}`；成功 200（`ALLOWED/DEGRADED`），拒绝 422（`REJECTED`）。
+- `POST /api/release/batch`：请求体
+  `{requestId, dataset, groups:[{groupId, dimensions{}}], metric, aggregation,
+  role, policyVersion}`；逐分组结论 + 预算对账单，恒 200（整批报文不合法时 400），
+  语义见 §5。
 - `GET /api/budgets?dataset=sales&region=us`：账户总额 / 余额 / 已耗。
 - `GET /api/policies`、`GET /api/policies/{version}`：已注册版本与参数。
 
@@ -102,30 +167,41 @@
 curl -s -XPOST localhost:8080/api/release -H 'Content-Type: application/json' -d '{
   "requestId":"demo-1","dataset":"sales","dimensions":{"region":"us"},
   "metric":"amount","aggregation":"SUM","role":"analyst","policyVersion":"policy-sales-v1"}'
+
+curl -s -XPOST localhost:8080/api/release/batch -H 'Content-Type: application/json' -d '{
+  "requestId":"demo-batch-1","dataset":"sales",
+  "groups":[{"groupId":"us","dimensions":{"region":"us"}},
+            {"groupId":"eu","dimensions":{"region":"eu"}}],
+  "metric":"amount","aggregation":"SUM","role":"analyst","policyVersion":"policy-sales-v1"}'
 ```
 
-## 6. 验证方法
+## 7. 验证方法
 
 ```bash
-mvn test                       # 全部 18 个用例
-mvn test -Dtest=BudgetConcurrencyTest
+mvn test                       # 全部 26 个用例
+mvn test -Dtest=BatchReleaseTest
 ```
 
 | 测试类 | 覆盖边界 |
 |--------|----------|
+| `BatchReleaseTest` | 批量部分成功部分拒绝互不影响；共享/独立预算键对账（响应数字 == 账本状态）；12 线程并发抢同一预算键不超扣；失败分组零扣减且错误类型稳定无内部细节；底层恢复后同一 requestId（批量与单发）重试拿到新结论且已成功分组不重复扣；确定性拒绝幂等零扣减 |
 | `BudgetConcurrencyTest` | 50 线程抢总额 1.0/单价 0.1：恰好 10 成功、40 拒绝，扣减合计严格等于总额 |
 | `BudgetExhaustionIntegrationTest` | 串行第 4 次可区分拒绝且不再扣；20 个不同 requestId 并发仅 3 个成功 |
 | `IdempotencyTest` | 同 requestId 重复请求返回相同结论、预算只扣一次；拒绝结论同样幂等且零扣减 |
 | `PolicyVersionTest` | 同版本同输入逐位复现；v1/v2 噪声尺度（1.0 vs 2.0）与投影不同；未知版本拒绝 |
 | `RejectionClassificationTest` | 7 种拒绝原因可区分；越权(40)+冲突(50) 并存时确定性归为越权；缺失字段降级带 notice |
 | `DeterministicNoiseTest` | 噪声纯函数复现、版本/维度敏感性、scale=1/epsilon |
-| `ApiIntegrationTest` | HTTP 成功路径、坏 JSON 归一化、越权区分、预算端点 |
+| `ApiIntegrationTest` | HTTP 成功路径、坏 JSON 归一化、越权区分、预算端点、批量部分成功与整批 malformed |
 
 测试与运行日志对每次判定打印 **请求标识、预算变化（before→remaining(-delta)）与
-判定依据**，例如：
+判定依据**；批量请求中每个分组的日志行带有 `requestId/分组标识` 前缀，
+批量末尾另有一行按预算键的对账汇总，例如：
 
 ```
 requestId=exh-seq-2 判定=ALLOWED 预算变化 key=exh-…#region=us 2.0000->1.0000(-1.0000)
   依据=policyVersion=… | groupSize=3>=3 | epsilon=1.0 | budget 2.0000-1.0000=1.0000 | noiseScale=1.0000
 requestId=r-prio 判定=REJECTED 预算变化=0 依据=access_denied detail=角色无权访问字段: region
+requestId=batch-recon-…/g1 判定=ALLOWED 预算变化 key=…#region=us 3.0000->2.0000(-1.0000) 依据=…
+requestId=batch-recon-… 批量汇总 总数=3 正常=3 降级=0 拒绝=0
+  预算对账=…#region=us 净扣减=2.0000 剩余=1.0000, …#region=eu 净扣减=1.0000 剩余=2.0000
 ```

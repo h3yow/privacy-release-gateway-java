@@ -87,4 +87,53 @@ class ApiIntegrationTest {
                 .andExpect(jsonPath("$.total").exists())
                 .andExpect(jsonPath("$.remaining").exists());
     }
+
+    @Test
+    void batchReleasePartialSuccessOverHttp() throws Exception {
+        String requestId = "api-batch-" + UUID.randomUUID();
+        String body = """
+                {
+                  "requestId": "%s",
+                  "dataset": "sales",
+                  "groups": [
+                    {"groupId": "ok", "dimensions": {"region": "us"}},
+                    {"groupId": "small", "dimensions": {"region": "eu"}}
+                  ],
+                  "metric": "amount",
+                  "aggregation": "SUM",
+                  "role": "analyst",
+                  "policyVersion": "policy-sales-v1"
+                }
+                """.formatted(requestId);
+        log.info("requestId={} 判定依据=HTTP 批量部分成功", requestId);
+        // 部分成功是正常语义：HTTP 200，逐分组结论在 results 中。
+        mockMvc.perform(post("/api/release/batch").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.requestId").value(requestId))
+                .andExpect(jsonPath("$.totalGroups").value(2))
+                .andExpect(jsonPath("$.allowedGroups").value(1))
+                .andExpect(jsonPath("$.rejectedGroups").value(1))
+                .andExpect(jsonPath("$.results[0].status").value("ALLOWED"))
+                .andExpect(jsonPath("$.results[0].budgetDelta").value(1.0))
+                .andExpect(jsonPath("$.results[1].status").value("REJECTED"))
+                .andExpect(jsonPath("$.results[1].errorCode").value("group_too_small"))
+                .andExpect(jsonPath("$.results[1].budgetDelta").value(0))
+                .andExpect(jsonPath("$.budgetUsage[0].totalDelta").value(1.0));
+    }
+
+    @Test
+    void malformedBatchMapsToBatchError() throws Exception {
+        String body = """
+                {
+                  "dataset": "sales",
+                  "groups": [{"dimensions": {"region": "us"}}],
+                  "metric": "amount",
+                  "aggregation": "SUM",
+                  "role": "analyst"
+                }
+                """;
+        mockMvc.perform(post("/api/release/batch").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.batchError").value("malformed_request"));
+    }
 }

@@ -1,5 +1,7 @@
 package com.github.h3yow.privacyreleasegatewayjava.web;
 
+import com.github.h3yow.privacyreleasegatewayjava.batch.BatchGatewayResponse;
+import com.github.h3yow.privacyreleasegatewayjava.batch.BatchQueryRequest;
 import com.github.h3yow.privacyreleasegatewayjava.budget.BudgetKey;
 import com.github.h3yow.privacyreleasegatewayjava.budget.BudgetLedger;
 import com.github.h3yow.privacyreleasegatewayjava.engine.PrivacyGateway;
@@ -42,6 +44,16 @@ public class GatewayController {
         GatewayResponse response = privacyGateway.submit(request);
         return ResponseEntity.status(
                 "REJECTED".equals(response.getStatus().name()) ? 422 : 200).body(response);
+    }
+
+    /**
+     * 批量发布入口。只要请求本身合法就返回 200，逐分组结论在 results 中
+     * （部分成功是正常语义，不是传输层错误）；整批报文不合法时返回 400。
+     */
+    @PostMapping("/release/batch")
+    public ResponseEntity<BatchGatewayResponse> releaseBatch(@RequestBody BatchQueryRequest request) {
+        BatchGatewayResponse response = privacyGateway.submitBatch(request);
+        return ResponseEntity.status(response.getBatchError() != null ? 400 : 200).body(response);
     }
 
     @GetMapping("/budgets")
