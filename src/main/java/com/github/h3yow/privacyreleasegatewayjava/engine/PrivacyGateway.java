@@ -42,7 +42,8 @@ import java.util.concurrent.ConcurrentMap;
  *       底层恢复后，同一 requestId 原样重发可得到新的结论；
  *       确定性业务拒绝（越权 / 分组过小 / 预算不足等）仍然幂等可复现。</li>
  *   <li>批量请求逐组独立判定：单组被拒绝或失败不影响其它分组；
- *       整批预算净变化恒等于各出结果分组 budgetDelta 之和。</li>
+ *       整批 totalBudgetDelta 只汇总本趟真正新扣预算的分组（不含命中幂等缓存的分组），
+ *       因此恒等于本趟请求对账本的实际净变化，可直接与预算查询对账。</li>
  *   <li>多问题命中时取 {@link ErrorCode#priority()} 最小者，归类完全确定且可复现。</li>
  * </ol>
  */
@@ -115,7 +116,11 @@ public class PrivacyGateway {
         for (GatewayResponse r : results) {
             if (r.getStatus() == ReleaseStatus.ALLOWED || r.getStatus() == ReleaseStatus.DEGRADED) {
                 succeeded++;
-                totalDelta += r.getBudgetDelta() == null ? 0d : r.getBudgetDelta();
+                // 整批合计只算“本趟真正新扣”的部分：命中幂等缓存的分组（deduplicated=true）
+                // 本趟账本没有变化，其 budgetDelta 是首次扣减的历史快照，不得计入本趟合计。
+                if (!r.isDeduplicated()) {
+                    totalDelta += r.getBudgetDelta() == null ? 0d : r.getBudgetDelta();
+                }
             }
         }
         int failed = results.size() - succeeded;

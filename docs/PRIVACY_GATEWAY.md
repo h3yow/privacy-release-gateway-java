@@ -130,8 +130,20 @@ curl -s -XPOST localhost:8080/api/release/batch -H 'Content-Type: application/js
 
 - 只有真正出结果的分组（`ALLOWED` / `DEGRADED`）才按策略 epsilon 扣减；
   被拒绝或失败的分组 `budgetDelta` 恒为 0，一分预算都不占。
-- 响应中的 `totalBudgetDelta` 恒等于各出结果分组 `budgetDelta` 之和，
-  也恒等于本批对账本（`GET /api/budgets`）造成的实际变化，可直接对账。
+- **`totalBudgetDelta` 代表“本趟请求真正新扣”的预算合计**，只累加本趟真正发生扣减的
+  分组（`deduplicated=false` 的出结果分组）；命中幂等缓存的分组（`deduplicated=true`）
+  本趟账本没有变化，其 `budgetDelta` 只是首次扣减的历史快照，**不计入本趟合计**。
+  因此 `totalBudgetDelta` 恒等于本趟请求对账本（`GET /api/budgets`）造成的实际净变化，
+  可直接对账；同一 `requestId` 各趟响应的 `totalBudgetDelta` 之和恒等于该标识在账本上的
+  累计扣减。
+- **整批原样重发**（如首次响应超时后照原请求再发一遍）：逐组结论幂等复现、
+  预算不重复扣，本趟 `totalBudgetDelta` 为 0——与预算查询结果恰好对上。
+- **混合重发**（一批中部分分组沿用历史结论、部分分组本趟才重算并扣钱，
+  含底层恢复后重新拿到结论的重发）：合计只算本趟新扣的分组，
+  沿用历史结论的分组一个都不算，本趟新扣的分组一个都不漏。
+- 逐组结论字段（加噪后的值、分组规模、`budgetDelta` 历史快照、判定依据、
+  正常 / 降级说明 / 拒绝）在重发时保持不变，`deduplicated=true` 用于区分
+  “本趟是否真正扣了钱”。
 - 一批中多个分组命中同一预算键（维度组合相同）时，在同一账户上顺序扣减，
   后一个分组的 `budgetBefore` 接上前一个的 `budgetRemaining`；
   并发下同一账户的“检查 + 扣减”原子完成，绝不超扣。
@@ -154,8 +166,9 @@ curl -s -XPOST localhost:8080/api/release/batch -H 'Content-Type: application/js
 ## 7. 验证方法
 
 ```bash
-mvn test                       # 全部 28 个用例
+mvn test                       # 全部 32 个用例
 mvn test -Dtest=BudgetConcurrencyTest
+mvn test -Dtest=BatchBudgetReconciliationTest   # 整批预算合计对账口径
 ```
 
 | 测试类 | 覆盖边界 |
@@ -167,7 +180,8 @@ mvn test -Dtest=BudgetConcurrencyTest
 | `RejectionClassificationTest` | 7 种拒绝原因可区分；越权(40)+冲突(50) 并存时确定性归为越权；缺失字段降级带 notice |
 | `DeterministicNoiseTest` | 噪声纯函数复现、版本/维度敏感性、scale=1/epsilon |
 | `ApiIntegrationTest` | HTTP 成功路径、坏 JSON 归一化、越权区分、预算端点 |
-| `BatchReleaseTest` | 批量部分成功不连累其它分组；响应合计与账本严格对账；批内同键顺序扣减；确定性拒绝重发幂等不重复扣 |
+| `BatchReleaseTest` | 批量部分成功不连累其它分组；响应合计与账本严格对账；批内同键顺序扣减；确定性拒绝重发幂等不重复扣、重发趟合计为 0 |
+| `BatchBudgetReconciliationTest` | 整批重发合计=0 且与账本对账；部分沿用历史结论+部分本趟新扣时合计只算新扣；并发重发只扣一次；并发新请求+重发共享同一预算键不超扣、各趟合计之和=账本累计扣减 |
 | `BatchBudgetConcurrencyTest` | 12 个并发批量抢同一预算键：恰好 3 组成功，响应扣减合计 = 账本已扣 = 总额，不超扣 |
 | `TransientFailureRetryTest` | 内部失败零扣减、不缓存、对外无内部细节；恢复后同一 requestId 重发拿到新结论且只扣一次；批量重发只重算失败分组 |
 | `BatchApiIntegrationTest` | 批量 HTTP 入口逐组结论、信封 400、重发命中缓存、预算端点可对账；单请求端点行为不变 |
@@ -182,4 +196,7 @@ requestId=r-prio 判定=REJECTED 预算变化=0 依据=access_denied detail=角�
 requestId=demo-b1 判定=ALLOWED 预算变化 key=sales#region=us 3.0000->2.0000(-1.0000) 依据=…
 requestId=demo-b1 判定=REJECTED 预算变化=0 依据=group_too_small detail=分组规模 2 小于最小阈值 3
 requestId=demo-b1 批量汇总 判定=PARTIAL_SUCCESS 分组数=2 成功=1 失败=1 整批预算净变化=-1.0000
+# 同一 requestId 原样重发：命中幂等缓存，本趟预算没有变化，整批合计为 0，与账本恰好对上
+requestId=demo-b1 判定=命中幂等缓存 预算变化=0 依据=缓存键 batch:demo-b1#0 已有结论 status=ALLOWED
+requestId=demo-b1 批量汇总 判定=PARTIAL_SUCCESS 分组数=2 成功=1 失败=1 整批预算净变化=-0.0000
 ```

@@ -193,7 +193,14 @@ class BatchReleaseTest {
         assertEquals("group_too_small", rejAgain.getErrorCode());
         assertEquals(1.0d, spent(dataset, usWeb), 1e-9, "重发不得二次扣减");
         assertEquals(0d, spent(dataset, euApp), 1e-9);
-        assertEquals(first.getTotalBudgetDelta(), second.getTotalBudgetDelta(), 1e-9);
+        // 整批合计口径 = 本趟真正新扣的部分：首趟扣 1.0，重发趟一分没扣，合计必须为 0，
+        // 才能与预算查询结果直接对上。
+        assertEquals(1.0d, first.getTotalBudgetDelta(), 1e-9);
+        assertEquals(0d, second.getTotalBudgetDelta(), 1e-9,
+                "重发趟没有真正扣预算，整批合计必须为 0");
+        log.info("requestId={} 重发对账 首趟合计=-{} 重发趟合计=-{} 账本实际扣减=-{}",
+                requestId, first.getTotalBudgetDelta(), second.getTotalBudgetDelta(),
+                spent(dataset, usWeb));
     }
 
     @Test

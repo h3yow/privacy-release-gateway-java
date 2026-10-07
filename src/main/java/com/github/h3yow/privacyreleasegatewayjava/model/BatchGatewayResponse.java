@@ -4,7 +4,9 @@ import java.util.List;
 
 /**
  * 批量发布统一结论。每个分组一条 {@link GatewayResponse}，顺序与请求 groups 一致；
- * 部分失败不影响其它分组结论。整批预算净变化恒等于各出结果分组 budgetDelta 之和。
+ * 部分失败不影响其它分组结论。
+ * totalBudgetDelta 只汇总本趟真正新扣预算的分组（不含命中幂等缓存的分组），
+ * 因此恒等于本趟请求对预算账本的实际净变化，可直接与预算查询结果对账。
  */
 public class BatchGatewayResponse {
 
@@ -13,7 +15,8 @@ public class BatchGatewayResponse {
     private int totalGroups;
     private int succeeded;
     private int failed;
-    /** 整批实际预算净扣减 = 各出结果分组 budgetDelta 之和。 */
+    /** 本趟请求真正新扣的预算合计 = 各非幂等命中（本次真正扣减）出结果分组 budgetDelta 之和；
+     *  重发时命中缓存的分组不计入，故恒等于本趟对账本的实际净变化。 */
     private double totalBudgetDelta;
     /** 逐组结论，下标与请求 groups 一一对应。 */
     private List<GatewayResponse> results;
