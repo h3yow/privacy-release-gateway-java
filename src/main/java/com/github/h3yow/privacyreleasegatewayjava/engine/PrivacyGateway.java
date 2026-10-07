@@ -42,7 +42,9 @@ import java.util.concurrent.ConcurrentMap;
  *       底层恢复后，同一 requestId 原样重发可得到新的结论；
  *       确定性业务拒绝（越权 / 分组过小 / 预算不足等）仍然幂等可复现。</li>
  *   <li>批量请求逐组独立判定：单组被拒绝或失败不影响其它分组；
- *       整批预算净变化恒等于各出结果分组 budgetDelta 之和。</li>
+ *       整批 {@code totalBudgetDelta} 只统计<strong>本趟</strong>真正新扣预算的分组
+ *       （{@code deduplicated=false}），命中缓存沿用历史结论的分组本趟零扣减、不计入合计，
+ *       因此合计恒等于本趟对账本造成的实际变化，重发时合计为 0。</li>
  *   <li>多问题命中时取 {@link ErrorCode#priority()} 最小者，归类完全确定且可复现。</li>
  * </ol>
  */
@@ -89,6 +91,12 @@ public class PrivacyGateway {
      * 单组被拒绝 / 失败不影响其它分组；出结果的分组才扣预算，失败分组净扣减为零。
      * 同一批量 requestId 重发时：确定性结论（含成功与业务拒绝）命中缓存不重复扣预算；
      * 曾因内部错误失败的分组会重新计算，底层恢复后即可拿到新结论。
+     * <p>
+     * 合计口径：{@code totalBudgetDelta} 只累加<strong>这一趟</strong>真正完成扣减的分组
+     * （{@code deduplicated=false} 的 ALLOWED/DEGRADED）。逐组结论（加噪值、分组规模、
+     * 当次扣减快照、判定依据）是历史首算时的快照、重发保持不变，但它们不代表本趟账本变化；
+     * 命中缓存的分组本趟净扣减为 0，一律不计入合计。恢复后重算成功的分组本趟确有新扣减，
+     * 照常计入。因此该合计可直接与预算查询（账本 spent 的本趟差值）对账。
      */
     public BatchGatewayResponse submitBatch(BatchQueryRequest request) {
         if (request == null || isBlank(request.requestId())
@@ -111,11 +119,19 @@ public class PrivacyGateway {
         }
 
         int succeeded = 0;
+        // 整批合计的口径是“这一趟对账本造成的实际变化”：
+        // 只有本趟真正新算出结论并完成扣减的分组（deduplicated=false）计入；
+        // 命中幂等缓存、沿用历史结论的分组这一趟零扣减，一个都不能算进去。
+        // 底层恢复后重算成功的分组本趟确有扣减（deduplicated=false），正常计入。
+        int chargedThisTrip = 0;
         double totalDelta = 0d;
         for (GatewayResponse r : results) {
             if (r.getStatus() == ReleaseStatus.ALLOWED || r.getStatus() == ReleaseStatus.DEGRADED) {
                 succeeded++;
-                totalDelta += r.getBudgetDelta() == null ? 0d : r.getBudgetDelta();
+                if (!r.isDeduplicated()) {
+                    chargedThisTrip++;
+                    totalDelta += r.getBudgetDelta() == null ? 0d : r.getBudgetDelta();
+                }
             }
         }
         int failed = results.size() - succeeded;
@@ -132,8 +148,9 @@ public class PrivacyGateway {
         batch.setTotalBudgetDelta(roundTo(totalDelta, 6));
         batch.setResults(results);
 
-        log.info("requestId={} 批量汇总 判定={} 分组数={} 成功={} 失败={} 整批预算净变化=-{}",
-                requestId, batchStatus, results.size(), succeeded, failed, format(totalDelta));
+        log.info("requestId={} 批量汇总 判定={} 分组数={} 成功={} 失败={} 本趟新扣分组={} 本趟整批预算净变化=-{}",
+                requestId, batchStatus, results.size(), succeeded, failed,
+                chargedThisTrip, format(totalDelta));
         return batch;
     }
 
@@ -147,7 +164,7 @@ public class PrivacyGateway {
             synchronized (lock) {
                 GatewayResponse cached = idempotencyCache.get(cacheKey);
                 if (cached != null) {
-                    log.info("requestId={} 判定=命中幂等缓存 预算变化=0 依据=缓存键 {} 已有结论 status={} errorCode={}",
+                    log.info("requestId={} 判定=命中幂等缓存(沿用历史结论) 本趟预算变化=0 依据=缓存键 {} 已有结论 status={} errorCode={}",
                             request.requestId(), cacheKey, cached.getStatus(), cached.getErrorCode());
                     // 返回副本并标注命中，缓存内的原始快照保持不可变。
                     GatewayResponse copy = copyOf(cached);

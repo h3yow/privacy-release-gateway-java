@@ -4,7 +4,12 @@ import java.util.List;
 
 /**
  * 批量发布统一结论。每个分组一条 {@link GatewayResponse}，顺序与请求 groups 一致；
- * 部分失败不影响其它分组结论。整批预算净变化恒等于各出结果分组 budgetDelta 之和。
+ * 部分失败不影响其它分组结论。
+ * <p>
+ * {@code totalBudgetDelta} 的口径是<strong>本趟请求对账本造成的实际净扣减</strong>：
+ * 只累加本趟真正新算出结论并完成扣减的分组（{@code deduplicated=false} 的
+ * ALLOWED/DEGRADED）。逐组结果里的 {@code budgetDelta} 是该分组历史首算时的快照，
+ * 重发时逐字复现、不代表本趟变化；命中缓存的分组本趟零扣减，不计入合计。
  */
 public class BatchGatewayResponse {
 
@@ -13,7 +18,7 @@ public class BatchGatewayResponse {
     private int totalGroups;
     private int succeeded;
     private int failed;
-    /** 整批实际预算净扣减 = 各出结果分组 budgetDelta 之和。 */
+    /** 本趟整批对账本的实际净扣减 = 本趟新扣分组（deduplicated=false）budgetDelta 之和；重发命中缓存时为 0。 */
     private double totalBudgetDelta;
     /** 逐组结论，下标与请求 groups 一一对应。 */
     private List<GatewayResponse> results;

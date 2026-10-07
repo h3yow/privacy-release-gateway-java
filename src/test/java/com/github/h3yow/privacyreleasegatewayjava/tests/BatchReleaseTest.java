@@ -189,11 +189,25 @@ class BatchReleaseTest {
         // 确定性结论（成功 + 业务拒绝）都幂等复现，不重复扣预算。
         assertTrue(okAgain.isDeduplicated());
         assertEquals(first.getResults().get(0).getValue(), okAgain.getValue());
+        // 逐组结论是历史首算快照：加噪值、分组规模、当次扣减数字、判定依据重发保持不变。
+        assertEquals(1.0d, okAgain.getBudgetDelta(), 1e-9,
+                "逐组 budgetDelta 是首算快照，重发逐字不变");
+        assertEquals(first.getResults().get(0).getBudgetBefore(), okAgain.getBudgetBefore(), 1e-9);
+        assertEquals(first.getResults().get(0).getBudgetRemaining(), okAgain.getBudgetRemaining(), 1e-9);
+        assertEquals(first.getResults().get(0).getDecisionBasis(), okAgain.getDecisionBasis());
+        assertEquals(first.getResults().get(0).getGroupSize(), okAgain.getGroupSize());
         assertTrue(rejAgain.isDeduplicated());
         assertEquals("group_too_small", rejAgain.getErrorCode());
         assertEquals(1.0d, spent(dataset, usWeb), 1e-9, "重发不得二次扣减");
         assertEquals(0d, spent(dataset, euApp), 1e-9);
-        assertEquals(first.getTotalBudgetDelta(), second.getTotalBudgetDelta(), 1e-9);
+
+        // 合计口径变化：首次合计 = 本趟新扣 = 1.0；重发这一趟没再扣钱，合计必须为 0，
+        // 而不是沿用首次那笔 1.0 —— 合计代表“这一趟”的账本变化，可直接与预算查询对账。
+        log.info("requestId={} 重发合计 首次={} 重发={}（重发本趟零扣减）",
+                requestId, first.getTotalBudgetDelta(), second.getTotalBudgetDelta());
+        assertEquals(1.0d, first.getTotalBudgetDelta(), 1e-9);
+        assertEquals(0d, second.getTotalBudgetDelta(), 1e-9,
+                "整批原样重发时本趟没有任何新扣减，合计必须为 0");
     }
 
     @Test
